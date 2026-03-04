@@ -52,7 +52,7 @@ def communicate_with_llm(message: str, system_prompt: str = "") -> str:
 
 def make_llm_call(system_prompt: str = "") -> Callable[[str], str]:
     """
-    Adapter for our pipeline interface:
+    Adapter for summarizer interface:
     llm_call(prompt: str) -> str
     """
 
