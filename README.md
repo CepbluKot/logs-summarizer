@@ -16,7 +16,7 @@
 3. `summarize_period(...) -> SummarizationResult`
 - Главный вызов суммаризации за период.
 
-Реализация: `simple_period_summarizer.py`
+Реализация: `llm_log_summarizer/simple_period_summarizer.py`
 
 ## Как совместить period + limit/offset
 
@@ -44,11 +44,11 @@ LIMIT :limit OFFSET :offset;
 
 1. Fetch page (`limit/offset`) в рамках периода.
 2. Разбить страницу на LLM-чанки (`llm_chunk_rows`).
-3. Сделать chunk summary для каждого чанка.
+3. На MAP-этапе LLM ищет именно проблемы (ошибки, таймауты, деградации), не общий обзор.
 4. Если chunk summary много, сделать reduce в несколько раундов.
-5. Вернуть финальный summary + метрики.
+5. На REDUCE-этапе LLM ранжирует TOP_PROBLEMS и формирует приоритетные действия.
+6. Вернуть финальный summary + метрики.
 
 ## Пример
 
 Смотри: `example_usage.py`
-

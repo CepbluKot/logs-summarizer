@@ -10,10 +10,10 @@ class DBPageFetcher(Protocol):
     Interface #1:
     Fetch one page of logs for a fixed time period and selected columns.
 
-    Notes for SQL side:
-    - Use stable ordering: ORDER BY ts, id
-    - Filter by period: ts >= period_start AND ts < period_end
-    - Apply incoming limit/offset
+    SQL expectation:
+    - WHERE ts >= :period_start AND ts < :period_end
+    - ORDER BY ts, id
+    - LIMIT :limit OFFSET :offset
     """
 
     def __call__(
@@ -31,7 +31,7 @@ class DBPageFetcher(Protocol):
 class LLMTextCaller(Protocol):
     """
     Interface #2:
-    Raw text-in / text-out LLM call.
+    Text prompt in -> text response out.
     """
 
     def __call__(self, prompt: str) -> str:
@@ -54,13 +54,33 @@ class SummarizationResult:
     pages_fetched: int
     rows_processed: int
     llm_calls: int
+    chunk_summaries: int
+    reduce_rounds: int
 
 
 class PeriodLogSummarizer:
     """
-    Interface #3 (entrypoint):
+    Interface #3:
     summarize_period(...)
+
+    Flow:
+    - map: summarize chunks of rows
+    - reduce: merge chunk summaries in rounds until final summary
     """
+
+    PROBLEM_KEYWORDS = (
+        "error",
+        "exception",
+        "timeout",
+        "failed",
+        "fail",
+        "fatal",
+        "critical",
+        "panic",
+        "denied",
+        "refused",
+        "unavailable",
+    )
 
     def __init__(
         self,
@@ -108,15 +128,20 @@ class PeriodLogSummarizer:
 
             for i in range(0, len(page), self.config.llm_chunk_rows):
                 rows_chunk = page[i : i + self.config.llm_chunk_rows]
+                ranked_chunk = self._rank_rows_by_problem_signal(rows_chunk, columns)
                 prompt = self._build_chunk_prompt(
                     period_start=period_start,
                     period_end=period_end,
                     columns=columns,
-                    rows=rows_chunk,
+                    rows=ranked_chunk,
                 )
                 chunk_summary = self.llm_call(prompt).strip()
                 if chunk_summary:
-                    chunk_summaries.append(self._truncate(chunk_summary, self.config.max_summary_chars))
+                    chunk_summaries.append(
+                        self._truncate(chunk_summary, self.config.max_summary_chars)
+                    )
+                else:
+                    chunk_summaries.append("Пустой ответ LLM на map-этапе.")
                 llm_calls += 1
 
             if len(page) < self.config.page_limit:
@@ -128,9 +153,11 @@ class PeriodLogSummarizer:
                 pages_fetched=pages_fetched,
                 rows_processed=rows_processed,
                 llm_calls=llm_calls,
+                chunk_summaries=0,
+                reduce_rounds=0,
             )
 
-        final_summary, reduce_calls = self._reduce_summaries(
+        final_summary, reduce_calls, reduce_rounds = self._reduce_summaries(
             chunk_summaries=chunk_summaries,
             period_start=period_start,
             period_end=period_end,
@@ -142,6 +169,8 @@ class PeriodLogSummarizer:
             pages_fetched=pages_fetched,
             rows_processed=rows_processed,
             llm_calls=llm_calls,
+            chunk_summaries=len(chunk_summaries),
+            reduce_rounds=reduce_rounds,
         )
 
     def _reduce_summaries(
@@ -150,9 +179,9 @@ class PeriodLogSummarizer:
         chunk_summaries: List[str],
         period_start: str,
         period_end: str,
-    ) -> tuple[str, int]:
+    ) -> tuple[str, int, int]:
         if len(chunk_summaries) == 1:
-            return chunk_summaries[0], 0
+            return chunk_summaries[0], 0, 0
 
         round_idx = 0
         current = chunk_summaries
@@ -174,12 +203,12 @@ class PeriodLogSummarizer:
                 )
                 merged = self.llm_call(prompt).strip()
                 if not merged:
-                    merged = "Пустой ответ LLM на этапе reduce."
+                    merged = "Пустой ответ LLM на reduce-этапе."
                 next_level.append(self._truncate(merged, self.config.max_summary_chars))
                 llm_calls += 1
             current = next_level
 
-        return current[0], llm_calls
+        return current[0], llm_calls, round_idx
 
     def _build_chunk_prompt(
         self,
@@ -189,13 +218,20 @@ class PeriodLogSummarizer:
         columns: Sequence[str],
         rows: List[Dict[str, Any]],
     ) -> str:
+        problem_rows = sum(1 for row in rows if self._row_problem_score(row, columns) > 0)
         lines = [
-            "Ты анализируешь логи и делаешь краткое техническое summary.",
-            "Верни обычный текст (не JSON), 5-12 пунктов.",
-            "Пиши только по фактам из входных строк.",
+            "Ты SRE-аналитик. Ищи проблемы, а не общий обзор.",
+            "Это MAP-этап: нужно проанализировать только этот кусок логов.",
+            "Верни обычный текст (не JSON) со строгими секциями:",
+            "1) TOP_PROBLEMS (3-7 пунктов, сортировка по критичности)",
+            "2) EVIDENCE (краткие факты из логов)",
+            "3) HYPOTHESES (возможные причины)",
+            "4) ACTIONS (что проверить/сделать)",
+            "Игнорируй рутину и нормальные сообщения, фокус на ошибках и деградациях.",
             "",
             f"Период: [{period_start}, {period_end})",
             f"Строк в этом куске: {len(rows)}",
+            f"Строк с problem-сигналами: {problem_rows}",
             f"Колонки: {', '.join(columns)}",
             "",
             "Логи:",
@@ -218,9 +254,14 @@ class PeriodLogSummarizer:
         summaries: List[str],
     ) -> str:
         lines = [
-            "Ты объединяешь несколько частичных summary логов в одно итоговое summary.",
-            "Верни обычный текст (не JSON), 7-15 пунктов.",
-            "Сохрани важные ошибки, повторяющиеся паттерны и возможные причины.",
+            "Ты SRE-аналитик. Это REDUCE-этап map-reduce по логам.",
+            "Объедини частичные summary в один итог по проблемам.",
+            "Верни обычный текст (не JSON) с секциями:",
+            "1) TOP_PROBLEMS (ранжирование critical->high->medium->low)",
+            "2) GLOBAL_PATTERNS (повторяющиеся симптомы)",
+            "3) ROOT_CAUSE_HYPOTHESES",
+            "4) PRIORITY_ACTIONS (сначала самое срочное)",
+            "Не теряй критичные инциденты, убирай дубли.",
             "",
             f"Период: [{period_start}, {period_end})",
             f"Reduce round: {reduce_round}",
@@ -232,6 +273,34 @@ class PeriodLogSummarizer:
             lines.append(text)
             lines.append("")
         return "\n".join(lines).strip()
+
+    def _rank_rows_by_problem_signal(
+        self,
+        rows: List[Dict[str, Any]],
+        columns: Sequence[str],
+    ) -> List[Dict[str, Any]]:
+        return sorted(rows, key=lambda row: self._row_problem_score(row, columns), reverse=True)
+
+    def _row_problem_score(self, row: Dict[str, Any], columns: Sequence[str]) -> int:
+        score = 0
+        text_parts = []
+        for col in columns:
+            value = row.get(col, "")
+            if value is None:
+                continue
+            text_parts.append(str(value).lower())
+        joined = " ".join(text_parts)
+
+        for keyword in self.PROBLEM_KEYWORDS:
+            if keyword in joined:
+                score += 1
+
+        if "level=error" in joined or "level=fatal" in joined:
+            score += 2
+        if "status=5" in joined or "http 5" in joined:
+            score += 1
+
+        return score
 
     @staticmethod
     def _validate_iso_datetime(value: str) -> None:

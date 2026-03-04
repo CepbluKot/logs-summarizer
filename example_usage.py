@@ -2,8 +2,12 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Sequence
 
-from llm_log_summarizer import has_required_env, make_llm_call
-from simple_period_summarizer import PeriodLogSummarizer, SummarizerConfig
+from llm_log_summarizer import (
+    PeriodLogSummarizer,
+    SummarizerConfig,
+    has_required_env,
+    make_llm_call,
+)
 
 
 def db_fetch_page(
@@ -56,6 +60,7 @@ if __name__ == "__main__":
             "pages_fetched": result.pages_fetched,
             "rows_processed": result.rows_processed,
             "llm_calls": result.llm_calls,
+            "chunk_summaries": result.chunk_summaries,
+            "reduce_rounds": result.reduce_rounds,
         }
     )
-
